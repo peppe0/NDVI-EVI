@@ -1,0 +1,6 @@
+a100 sm_80
+a40 sm_86
+h200 sm_90 ? 90a
+v100 sm_70
+
+sbatch --export=ALL,PROFILE_MODE=nsys launcher_nvJ2000_fixed.sbatch

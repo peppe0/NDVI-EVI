@@ -1,0 +1,33 @@
+# Virtual environment
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Heavy datasets and images
+images/
+scenes_files/
+cpu_results/
+gpu_results/
+gpu_profiling/
+test_nvj2000/
+
+# Large installer scripts
+Miniconda3-latest-Linux-x86_64.sh
+
+# SLURM logs & error files
+*.err
+*.log
+
+# NVTX / Nsys profiling files
+*.nsys-rep
+*.sqlite
+
+# Compiled C/C++/CUDA binary executables
+main
+main_nvJ2000
+main_nvJ2000_a40
+main_nvJ2000_fixed
+main_nvJ2000_reduction
+main_nvJ2000_stream
+test_nvjpeg2k
