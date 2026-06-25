@@ -329,17 +329,15 @@ __global__ void colormap_rdylgn_kernel(const float* d_index,
     float t = (val + 1.0f) * 0.5f;
 
     unsigned char r = 0, g = 0, b = 0;
-
     if (t <= 0.5f) {
-        // Red to Yellow: (255, 0, 0) to (255, 255, 0)
         r = 255;
         g = (unsigned char)(255.0f * (t / 0.5f));
         b = 0;
     } else {
-        // Yellow to Green: (255, 255, 0) to (0, 255, 0)
-        r = (unsigned char)(255.0f * (1.0f - ((t - 0.5f) / 0.5f)));
-        g = 255;
-        b = 0;
+        float u = (t - 0.5f) / 0.5f;
+        r = (unsigned char)(255.0f * (1.0f - u) + 34.0f * u);
+        g = (unsigned char)(255.0f * (1.0f - u) + 139.0f * u);
+        b = (unsigned char)(34.0f * u);
     }
 
     d_rgb[idx * 3 + 0] = r;

@@ -154,13 +154,6 @@ SCENES = [
     },
 
     {
-        "red": "images/corrupted_2025-04-30/20250430_B04_10m_corrupted_all.jp2",
-        "nir": "images/2025-04-30/20250430_B08_10m_corrupted_all.jp2",
-        "blue": "images/2025-04-30/20250430_B02_10m_corrupted_all.jp2",
-        "name": "corrupted_2025-04-30"
-    },
-
-    {
         "red": "images/2025-05-10/20250510_B04_10m.jp2",
         "nir": "images/2025-05-10/20250510_B08_10m.jp2",
         "blue": "images/2025-05-10/20250510_B02_10m.jp2",
@@ -413,93 +406,121 @@ SCENES = [
 ]
 
 @timer
-def compute_statistics(input, flag):
-    index = input.astype(float)
-
+def compute_statistics(ndvi, evi, red, nir, blue):
     # -------------------------
     # 1. Local mean (3x3)
     # -------------------------
     kernel_size = 3
-    local_mean = ndimage.uniform_filter(index, size=kernel_size)
-
-    avg_local_mean = np.mean(local_mean)
+    ndvi_mean = ndimage.uniform_filter(ndvi, size=kernel_size)
+    avg_local_mean = np.mean(ndvi_mean)
 
     # -------------------------
     # 2. Local variance (3x3)
     # -------------------------
-    local_sq_mean = ndimage.uniform_filter(index**2, size=kernel_size)
-    local_var = local_sq_mean - local_mean**2
-
-    avg_local_var = np.mean(local_var)
+    ndvi_sq_mean = ndimage.uniform_filter(ndvi**2, size=kernel_size)
+    ndvi_var = ndvi_sq_mean - ndvi_mean**2
+    ndvi_var = np.maximum(ndvi_var, 0.0)
+    avg_local_var = np.mean(ndvi_var)
 
     # -------------------------
     # 3. Sobel-like gradient magnitude
     # -------------------------
-    gx = ndimage.sobel(index, axis=1)
-    gy = ndimage.sobel(index, axis=0)
-    grad = np.sqrt(gx**2 + gy**2)
-
-    avg_grad = np.mean(grad)
-
-    # -------------------------
-    # 4. Quality flags
-    # -------------------------
-    flat_pixels = np.sum(np.abs(grad) < 1e-6)
-
-    invalid_pixels = np.sum(~np.isfinite(index))
-    black_pixels = np.sum(index <= 0)
-
-    saturated_pixels = np.sum(index >= 0.9)  # puoi adattare soglia
-
-    # outlier semplice (robusto ma veloce)
-    mean = np.mean(index)
-    std = np.std(index)
-    outliers = np.sum((index < mean - 3*std) | (index > mean + 3*std))
-
-    # stripe-like (euristica semplice: righe con varianza bassa)
-    row_var = np.var(index, axis=1)
-    stripe_like = np.sum(row_var < np.mean(row_var) * 0.1)
-
-    total = index.size
-
-    quality_score = 1.0 - (
-        (invalid_pixels + outliers + flat_pixels) / total
-    )
-    quality_score = np.clip(quality_score, 0, 1)
+    gx = ndimage.sobel(ndvi, axis=1)
+    gy = ndimage.sobel(ndvi, axis=0)
+    ndvi_grad = np.sqrt(gx**2 + gy**2)
+    avg_grad = np.mean(ndvi_grad)
 
     # -------------------------
-    # 5. Health classification
+    # 4. Quality flags & score (GPU-like logic)
     # -------------------------
-    dead = np.sum(index < 0.2)
-    diseased = np.sum((index >= 0.2) & (index < 0.5))
-    healthy = np.sum(index >= 0.5)
-    uncertain = invalid_pixels
+    black = (red <= 1) | (nir <= 1) | (blue <= 1)
+    saturated = (red >= 65530) | (nir >= 65530) | (blue >= 65530)
+    invalid = ~np.isfinite(ndvi) | ~np.isfinite(evi)
 
-    value = ""
-    if flag == 1:
-        value += "EVI"
-    else:
-        value += "NDVI"
+    z = np.abs(ndvi - ndvi_mean) / np.sqrt(ndvi_var + 1e-8)
+    outlier = z > 3.0
 
-    print(f"\n{value} Advanced Statistics:")
-    print(f"Average {value} local mean (3x3): {avg_local_mean:.6f}")
-    print(f"Average {value} local var  (3x3): {avg_local_var:.6f}")
-    print(f"Average {value} Sobel-like grad: {avg_grad:.6f}")
+    flat = (ndvi_var < 1e-5) & (ndvi_grad < 1e-2)
+
+    # Stripe detector (matching CUDA shift/clamp behavior)
+    red_left = np.roll(red, 1, axis=1)
+    red_left[:, 0] = red[:, 0]
+    red_right = np.roll(red, -1, axis=1)
+    red_right[:, -1] = red[:, -1]
+
+    red_up = np.roll(red, 1, axis=0)
+    red_up[0, :] = red[0, :]
+    red_down = np.roll(red, -1, axis=0)
+    red_down[-1, :] = red[-1, :]
+
+    row_min = np.minimum(red, np.minimum(red_left, red_right))
+    row_max = np.maximum(red, np.maximum(red_left, red_right))
+    col_min = np.minimum(red, np.minimum(red_up, red_down))
+    col_max = np.maximum(red, np.maximum(red_up, red_down))
+
+    stripe = (row_max - row_min <= 1) & (col_max - col_min <= 1)
+
+    # Quality score per pixel matching GPU weighted penalty system
+    score = np.ones_like(ndvi, dtype=float)
+    score[black] -= 0.40
+    score[saturated] -= 0.30
+    score[outlier] -= 0.20
+    score[flat] -= 0.10
+    score[invalid] -= 0.50
+    score[stripe] -= 0.20
+    score = np.clip(score, 0.0, 1.0)
+    quality_score = np.mean(score)
+
+    total = ndvi.size
+
+    # Health classification matching GPU (uses combined indices and quality flags)
+    # 0 = DEAD, 1 = DISEASED, 2 = HEALTHY, 3 = UNCERTAIN
+    health_class = np.full_like(ndvi, 2, dtype=np.uint8) # Default to HEALTHY
+    
+    # Diseased: ndvi < 0.45 or evi < 0.25 or flags (outlier/black/stripe)
+    diseased = (ndvi < 0.45) | (evi < 0.25) | outlier | black | stripe
+    health_class[diseased] = 1
+    
+    # Dead: ndvi < 0.20 or evi < 0.10 (overrides diseased)
+    dead = (ndvi < 0.20) | (evi < 0.10)
+    health_class[dead] = 0
+    
+    # Uncertain: invalid or saturated (overrides all)
+    uncertain = invalid | saturated
+    health_class[uncertain] = 3
+
+    # Counts
+    count_black = np.sum(black)
+    count_saturated = np.sum(saturated)
+    count_outlier = np.sum(outlier)
+    count_flat = np.sum(flat)
+    count_invalid = np.sum(invalid)
+    count_stripe = np.sum(stripe)
+
+    count_dead = np.sum(health_class == 0)
+    count_diseased = np.sum(health_class == 1)
+    count_healthy = np.sum(health_class == 2)
+    count_uncertain = np.sum(health_class == 3)
+
+    print(f"\nAdvanced Statistics:")
+    print(f"Average NDVI local mean (3x3): {avg_local_mean:.6f}")
+    print(f"Average NDVI local var  (3x3): {avg_local_var:.6f}")
+    print(f"Average NDVI Sobel-like grad: {avg_grad:.6f}")
     print(f"Average Quality Score: {quality_score:.6f}")
 
     print("Quality Flags Summary:")
-    print(f"  Black pixels:     {black_pixels} ({black_pixels/total:.2%})")
-    print(f"  Saturated pixels: {saturated_pixels} ({saturated_pixels/total:.2%})")
-    print(f"  Outlier pixels:   {outliers} ({outliers/total:.2%})")
-    print(f"  Flat pixels:      {flat_pixels} ({flat_pixels/total:.2%})")
-    print(f"  Invalid pixels:   {invalid_pixels} ({invalid_pixels/total:.2%})")
-    print(f"  Stripe-like:      {stripe_like} ({stripe_like/total:.2%})")
+    print(f"  Black pixels:     {count_black} ({count_black/total:.6%})")
+    print(f"  Saturated pixels: {count_saturated} ({count_saturated/total:.6%})")
+    print(f"  Outlier pixels:   {count_outlier} ({count_outlier/total:.6%})")
+    print(f"  Flat pixels:      {count_flat} ({count_flat/total:.6%})")
+    print(f"  Invalid pixels:   {count_invalid} ({count_invalid/total:.6%})")
+    print(f"  Stripe-like:      {count_stripe} ({count_stripe/total:.6%})")
 
     print("Health Class Summary:")
-    print(f"  Dead:      {dead} ({dead/total:.2%})")
-    print(f"  Diseased:  {diseased} ({diseased/total:.2%})")
-    print(f"  Healthy:   {healthy} ({healthy/total:.2%})")
-    print(f"  Uncertain: {uncertain} ({uncertain/total:.2%})")
+    print(f"  Dead:      {count_dead} ({count_dead/total:.6%})")
+    print(f"  Diseased:  {count_diseased} ({count_diseased/total:.6%})")
+    print(f"  Healthy:   {count_healthy} ({count_healthy/total:.6%})")
+    print(f"  Uncertain: {count_uncertain} ({count_uncertain/total:.6%})")
 
 
 @timer
@@ -547,10 +568,9 @@ def process_scene(red_path, nir_path, blue_path, out_path):
     print("Calculating Indices...")
 
     ndvi_result = calculate_ndvi(red_band, nir_band)
-    compute_statistics(ndvi_result, 0)
-
     evi_result = calculate_evi(red_band, nir_band, blue_band)
-    compute_statistics(evi_result, 1)
+
+    compute_statistics(ndvi_result, evi_result, red_band, nir_band, blue_band)
 
     ndvi_health = generate_health_map(ndvi_result)
     evi_health = generate_health_map(evi_result)

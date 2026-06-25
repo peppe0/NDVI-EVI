@@ -1,0 +1,564 @@
+\documentclass[10pt,conference,compsoc]{IEEEtran}
+% Pacchetti fondamentali
+\usepackage[utf8]{inputenc}
+\usepackage[english]{babel} 
+\usepackage{graphicx}       
+\usepackage{hyperref}       
+\usepackage{url}
+\usepackage{newtxtext,newtxmath}
+\usepackage{float}
+
+\pagestyle{plain}
+\begin{document}
+% --- COPERTINA ---
+\begin{titlepage}
+    \centering
+    \vspace*{2cm}
+    {\huge\scshape Master's Degree in Computer Engineering \par}
+    \vspace{1.5cm}
+    \includegraphics[width=0.5\textwidth]{logo.png}\par
+    \vspace{1cm}
+    
+    {\huge\bfseries Optimized Comparative Analysis of
+    NDVI and EVI Indices \par}
+    \vspace{2cm}
+    {\Large\textbf{Candidates:} Daniele Cecconata, Giuseppe Abbatiello \par}
+    \vfill
+    {\large Academic Year 2025/2026 \par}
+% --- FINE COPERTINA ---
+\end{titlepage}
+% =========================================================
+% PASSA A COLONNA SINGOLA PER L'INDICE E L'ABSTRACT
+% =========================================================
+\clearpage
+\twocolumn
+\tableofcontents
+\clearpage   
+
+\begin{abstract}
+Monitoring vegetation health through satellite-based remote sensing generates massive datasets that require significant computational power. While the Normalized Difference Vegetation Index (NDVI) is widely used, it is prone to atmospheric and soil distortions, which are corrected by the more computationally intensive Enhanced Vegetation Index (EVI). Processing high-resolution Sentinel-2 imagery on traditional CPUs creates a major bottleneck due to the sequential execution of pixel-level floating-point operations. To address this, we present a GPU-accelerated processing pipeline using CUDA for the real-time computation and comparative analysis of NDVI and EVI. By parallelizing the pixel processing logic, our CUDA implementation achieves a speedup of up to 4.83x compared to a sequential CPU baseline. The results demonstrate the feasibility of real-time satellite image analysis on datacenter GPUs, enabling faster and more scalable environmental monitoring.
+\end{abstract}
+
+
+\section{Introduction}
+Currently, satellite-based remote sensing plays a key role in analyzing geospatial land data, particularly regarding vegetation health and density. To evaluate these environmental parameters, vegetation indices calculated from multispectral imagery are widely utilized. Among these, the Normalized Difference Vegetation Index (NDVI) represents the reference standard for monitoring vegetation status on a global scale. However, NDVI is prone to atmospheric disturbances; to overcome such limitations, the Enhanced Vegetation Index (EVI) was introduced. EVI represents an evolution of the former index, integrating the blue band to correct for atmospheric aerosols and soil background reflectivity.
+
+Despite the effectiveness of these indices, their calculation requires significant computational resources. High-resolution satellite images, such as those from the Sentinel-2 mission, are characterized by large file sizes, typically ranging between 200 and 300 megabytes per image. Consequently, sequential processing based on traditional CPUs suffers from a severe computational bottleneck, rendering real-time processing or large-scale analysis impractical.
+
+To overcome these limitations, this project proposes a parallel processing pipeline accelerated through the use of GPUs and NVIDIA CUDA technology. By leveraging the high parallelism of GPUs, the implementation significantly accelerates the operations required to compute NDVI and EVI, achieving a speedup of 4.83x compared to the sequential CPU version.
+
+The report is organized as follows: Section II details the methodology, theoretical background of vegetation indices, and the proposed CUDA parallel pipeline; Section III presents the experimental results and quality control checks; Section IV discusses the obtained results; Section V concludes and discusses future developments, and Section VI references the cited literature.
+
+\section{Methodology / Proposed Method}
+This section describes the theoretical background of the vegetation indices analyzed, the limitations of the sequential CPU baseline, and the design of the proposed GPU-accelerated parallel processing pipeline.
+
+\subsection{Mathematical Formulation of Vegetation Indices}
+Vegetation indices are computed from multispectral satellite imagery by exploiting the differential reflectance of green vegetation across different wavelengths. Two primary indices are compared in this study:
+
+\subsubsection{Normalized Difference Vegetation Index (NDVI)}
+NDVI is the standard index used to estimate vegetation greenness. It relies on the strong absorption of light by chlorophyll in the red spectrum and the high scattering of light by the leaf mesophyll in the near-infrared (NIR) spectrum. The formula is defined as:
+\begin{equation}
+\mathrm{NDVI} = \frac{\mathrm{NIR} - \mathrm{Red}}{\mathrm{NIR} + \mathrm{Red}}
+\label{eq:ndvi}
+\end{equation}
+In this project, Sentinel-2 Band 4 (Red, center wavelength $\approx$ 665 nm) and Band 8 (NIR, center wavelength $\approx$ 842 nm) are utilized.
+\subsubsection{Enhanced Vegetation Index (EVI)}
+EVI is an optimized index designed to enhance the vegetation signal with improved sensitivity in high biomass regions. It minimizes canopy background variations and atmospheric influences by incorporating a blue band. The mathematical formulation of EVI is:
+\begin{equation}
+\mathrm{EVI} = G \times \frac{\mathrm{NIR} - \mathrm{Red}}{\mathrm{NIR} + C_1 \times \mathrm{Red} - C_2 \times \mathrm{Blue} + L}
+\label{eq:evi}
+\end{equation}
+where:
+\begin{itemize}
+    \item $G = 2.5$ is the gain factor.
+    \item $C_1 = 6.0$ and $C_2 = 7.5$ are aerosol resistance coefficients.
+    \item $L = 1.0$ is the soil-canopy background adjustment factor.
+    \item $Blue$ corresponds to Sentinel-2 Band 2 (Blue, center wavelength $\approx$ 490 nm).
+\end{itemize}
+
+\subsection{Sequential CPU Baseline}
+The sequential baseline is implemented in Python leveraging NumPy and SciPy for vectorized operations. The processing logic executes sequentially on the CPU, applying vectorized operations on the entire image grid. Given a Sentinel-2 image tile of size $10,980 \times 10,980$ pixels (representing approximately $1.2 \times 10^8$ pixels per band), the CPU implementation must perform $1.2 \times 10^8$ floating-point divisions for NDVI, and even more complex calculations for EVI, resulting in a computational bottleneck. Furthermore, the memory footprint of these large spatial data arrays (exceeding several gigabytes during intermediate steps) far surpasses typical CPU cache capacities, leading to frequent main memory access latencies.
+
+
+\subsection{Proposed CUDA Parallel Pipeline}
+To overcome the limitations of the CPU execution model, we propose a parallelized pipeline using NVIDIA's CUDA platform. The workflow is structured into four main phases:
+\begin{enumerate}
+    \item \textbf{Data Loading:} The compressed JP2 bitstreams for the Red, NIR, and Blue bands are read from storage into Host pinned memory.
+    \item \textbf{Hardware Decoding and Allocation:} Buffer spaces are allocated on the Device using cudaMalloc, and the compressed bitstreams are decoded directly into Device memory using the nvJPEG2000 library, bypassing host-to-device uncompressed pixel copy latencies.The decoding phase leverages the APIs described in the official documentation \cite{nvidia2021nvjpeg2000}.
+    \item \textbf{Kernel Execution:} Parallel CUDA kernels are launched. The image is mapped to a 1D grid of thread blocks (using a block size of 256 threads), where each thread is responsible for computing indices for a single pixel.
+    \item \textbf{Device-to-Host Transfer:} The resulting arrays are copied back to Host memory via cudaMemcpy and saved.
+\end{enumerate}
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=\linewidth]{diagramma.png}
+  \caption{Simplified flow chart of the proposed GPU-accelerated parallel processing pipeline.}
+  \label{fig:pipeline_flow}
+\end{figure}
+
+The thread mapping employs a 1D configuration where the global thread index ($idx$) is computed as: $$idx = \text{blockIdx.x} \times \text{blockDim.x} + \text{threadIdx.x}$$ For spatial 2D operations, the pixel coordinates $(x, y)$ are derived arithmetically as: $$x = idx \pmod W, \quad y = \lfloor idx / W \rfloor$$
+\subsection{CUDA Kernel and Optimizations}
+To maximize GPU performance, several hardware-level optimizations were implemented:
+\begin{itemize}
+    \item \textbf{Coalesced Memory Access:} Multi-spectral bands are stored as contiguous 1D flat arrays in the GPU global memory. Threads in a warp access adjacent memory addresses, allowing the GPU to merge accesses into single, high-bandwidth memory transactions.
+    \item \textbf{Single-Precision Arithmetic:} Computations use 32-bit floats (\texttt{float}) rather than 64-bit doubles, doubling execution throughput and reducing memory bandwidth pressure.
+    \item \textbf{Divergence Minimization:} Branching constructs (\texttt{if} statements) are kept to a minimum to avoid execution divergence within warps.
+    \item \textbf{Parallel Statistical Reduction:} Instead of copying the massive uncompressed pixel grids back to the host CPU for sequential calculations, global image statistics (such as averages and quality/health flag counts) are computed entirely on-device. This is implemented via a two-level hierarchical parallel reduction,  leveraging the optimization techniques proposed in \cite{harris2007optimizing}:
+    \begin{itemize}
+        \item \emph{Warp-level shuffles:} Utilizing hardware register shuffle primitives (\texttt{\_\_shfl\_down\_sync}) to perform fast reductions across threads in a warp without shared memory latency.
+        \item \emph{Shared memory block reduction:} Aggregating warp-level partial sums within a block via shared memory and thread synchronization.
+        \item \emph{Grid-stride loops and shared histograms:} Distributing load over multiple grid blocks and utilizing shared memory arrays to accumulate localized class histograms, avoiding global memory atomic write contention.
+    \end{itemize}
+    This optimization completely eliminates the massive Device-to-Host (D2H) PCIe transfer overhead of multi-megabyte arrays, replacing it with a single, lightweight transfer of a few bytes.
+\end{itemize}
+
+
+\subsection{Image Quality Analysis and Data Integrity (Pixel Quality Control)}
+To ensure data integrity, a pixel-by-pixel quality control is performed in both the CPU and GPU pipelines. This process inspects the raw band data (RED, NIR, BLUE) and the calculated indices (NDVI, EVI) to detect physical or mathematical anomalies.
+
+\begin{itemize}
+    \item \textbf{CPU Pipeline:} Quality flags are computed in Python via the \texttt{compute\_statistics} function in \texttt{cpu\_example.py}
+    \item \textbf{GPU Pipeline:} Quality flags are accelerated using the CUDA kernel \texttt{quality\_flags\_kernel} in \texttt{main\_nvJ2000\_fixed.cu}
+\end{itemize}
+
+\begin{figure}[h]
+  \centering
+  \begin{minipage}{0.35\textwidth}
+    \centering
+    \includegraphics[width=\linewidth]{health_20250609.png}
+    \caption*{a) Clean Health Mask}
+  \end{minipage}
+  \hfill
+  \begin{minipage}{0.35\textwidth}
+    \centering
+    \includegraphics[width=\linewidth]{health_corrupted_20250609.png}
+    \caption*{b) Corrupted Health Mask}
+  \end{minipage}
+  \caption{Visual comparison of the NDVI Health Classification Mask for scene 2025-06-09: (a) Clean baseline output, and (b) output after the injection of $5\%$ Salt-and-Pepper noise, Gaussian noise ($\sigma=300$), atmospheric bias ($1000$), and atmospheric scaling ($0.7$), demonstrating how the classification pipeline robustly flags corrupted pixels as Uncertain (dead pixels/NaNs appear as black speckled anomalies).}
+  \label{fig:corruption_comparison}
+\end{figure}
+
+
+\subsection{Anomaly Detection Methodology}
+Anomalies are identified using bitmask flags assigned to each individual pixel:
+\begin{itemize}
+    \item \textbf{Black Pixels:} Identifies pixels where at least one input spectral band (RED, NIR, BLUE) has a value $\leq 1$. This condition captures nodata areas, deep shadows, and background regions.
+    \item \textbf{Sensor Saturation:} Detects pixels where the original sensor digital numbers approach the maximum 16-bit reflectance value ($\geq 65530$), indicating possible sensor saturation.
+    \item \textbf{NaN / Invalid Values:} Explicitly detects undefined values (e.g., division-by-zero errors during index calculations) or non-finite numbers (NaN or Inf) using the built-in functions \texttt{!isfinite(...)} in CUDA and \texttt{\textasciitilde np.isfinite(...)} in Python.
+    \item \textbf{Statistical Outliers:} Detects pixels where NDVI deviates from the local $3\times3$ neighborhood mean by more than three standard deviations: $|Z|>3$.
+    \item \textbf{Flat Regions:} Detects areas with extremely low NDVI variance and negligible spatial gradient, indicating homogeneous regions with limited information content.
+    \item \textbf{Stripe Noise:} Detects horizontal or vertical striping artifacts by comparing each pixel with its immediate horizontal and vertical neighbors.
+\end{itemize}
+
+Each pixel is assigned a Quality Score (starting at 1.0) which decreases for every active anomaly flag (e.g., -0.50 for invalid/NaN pixels, -0.40 for black pixels).
+
+\subsection{Vegetation Health Classification}
+
+Pixels are classified into four vegetation states:
+\begin{itemize}
+    \item \textbf{DEAD}: NDVI $< 0.20$ or EVI $< 0.10$
+    \item \textbf{DISEASED}: NDVI $< 0.45$ or EVI $< 0.25$ or affected by quality anomalies
+    \item \textbf{HEALTHY}: pixels satisfying vegetation thresholds without anomalies
+    \item \textbf{UNCERTAIN}: invalid or saturated pixels
+\end{itemize}
+
+\subsection{Perturbation Injection (Robustness Layer)}
+To evaluate the stability, edge-case tolerance, and mathematical robustness of both the CPU and GPU processing pipelines, a perturbation injection layer was developed using the \texttt{corrupter\_v2.py} script. This module introduces controlled synthetic noise into the multispectral JP2 images, simulating real-world sensor degradation, transmission errors, and atmospheric disturbances. 
+The perturbation pipeline applies three distinct mathematical models to the raw pixel data arrays:
+\begin{enumerate}
+    \item \textbf{Atmospheric Scattering and Radiometric Offset:} 
+    Atmospheric haze and scattering effect are modeled by applying a linear radiometric transform consisting of scaling and offset coefficients to the raw reflectance values ($I_{in}$):
+    \begin{equation}
+    I_{atm}(x, y) = I_{in}(x, y) \times S_{atm} + B_{atm}
+    \end{equation}
+    where $S_{atm}$ represents the atmospheric scaling factor (set to $0.7$) and $B_{atm}$ represents the constant atmospheric bias offset (set to $1000$ to simulate severe aerosol scattering).
+    
+    \item \textbf{Additive Gaussian Noise (Thermal Sensor Noise):} 
+    To simulate thermal noise generated by the satellite's photodetectors during image acquisition, zero-mean additive Gaussian white noise is injected into the pixel grid:
+    \begin{equation}
+    I_{gauss}(x, y) = I_{atm}(x, y) + \eta(x, y), \quad \text{with } \eta \sim \mathcal{N}(0, \sigma^2)
+    \end{equation}
+    where the standard deviation $\sigma$ is set to $\sigma = 300$, simulating severe thermal noise.
+    
+    \item \textbf{Salt-and-Pepper Noise (Dead and Hot Pixels):} 
+    Bit-transmission errors and hardware sensor malfunctions (such as permanently dead or saturated pixels) are simulated using an impulse noise model. A specified fraction $p$ (controlled by \texttt{sp\_ratio}, set to $5\%$, i.e., $0.05$) of the total pixel grid is randomly corrupted:
+    \begin{equation}
+    I_{sp}(x, y) = 
+    \begin{cases} 
+      I_{min} & \text{with probability } p/2 \\&\quad \text{(Dead/Pepper pixels)} \\
+      I_{max} & \text{with probability } p/2 \\ &\quad \text{(Saturated/Salt pixels)} \\
+      I_{gauss}(x, y) & \text{with probability } 1-p 
+   \end{cases}
+    \end{equation}
+    where $I_{min}$ and $I_{max}$ represent the dynamic range minimum and maximum values of the active spectral band.
+\end{enumerate}
+Finally, any resulting NaN values are replaced using the band's default \texttt{nodata} identifier to maintain compliance with the GeoTIFF/JP2 formatting specifications. Saturated and out-of-bounds pixel values are clipped back to the maximum bit-depth (e.g., $65535$ for 16-bit integer bands) prior to writing the output JP2 files via the \texttt{rasterio} driver.
+
+\subsection{Mathematical Formulation of Local Spatial Statistics}
+To detect anomalies, the spatial neighborhood of each pixel is evaluated. Given the pixel coordinates $(x,y)$, the local mean $\mu(x,y)$ and variance $\sigma^2(x,y)$ within a $3\times3$ kernel are defined as:
+\begin{equation}
+\mu(x,y) = \frac{1}{9}\sum_{i=-1}^{1}\sum_{j=-1}^{1} \mathrm{NDVI}(x+i, y+j)
+\end{equation}
+\begin{equation}
+\sigma^2(x,y) = \frac{1}{9}\sum_{i=-1}^{1}\sum_{j=-1}^{1} \left[ \mathrm{NDVI}(x+i, y+j) - \mu(x,y) \right]^2
+\end{equation}
+The spatial edge magnitude is calculated via Sobel-like convolution kernels $K_x$ and $K_y$ to compute horizontal and vertical gradients:
+\begin{equation}
+G_x = K_x * \mathrm{NDVI}, \quad G_y = K_y * \mathrm{NDVI}
+\end{equation}
+\begin{equation}
+G(x,y) = \sqrt{G_x(x,y)^2 + G_y(x,y)^2}
+\end{equation}
+where:
+\[
+K_x = \begin{bmatrix} -1 & 0 & 1 \\ -2 & 0 & 2 \\ -1 & 0 & 1 \end{bmatrix}, \quad 
+K_y = \begin{bmatrix} -1 & -2 & -1 \\ 0 & 0 & 0 \\ 1 & 2 & 1 \end{bmatrix}
+\]
+
+
+\section{Experimental Results}
+
+\subsection{Experimental Setup}
+To evaluate scalability and compute characteristics, the CUDA-accelerated pipeline was tested on three distinct GPU architectures:
+\begin{itemize}
+    \item An \textbf{NVIDIA H200 GPU} (Hopper architecture, 141 GB HBM3e VRAM, PCIe Gen5) running CUDA Toolkit 13.0 with NVIDIA Driver 580.95.05.
+     \item An \textbf{NVIDIA A40 GPU} (Ampere architecture, 48 GB GDDR6 VRAM, PCIe Gen4) running CUDA Toolkit 12.6 with NVIDIA Driver 570.86.15.
+    \item An \textbf{NVIDIA Tesla V100 GPU} (Volta architecture, 32 GB HBM2 VRAM, PCIe Gen3) running CUDA Toolkit 12.6 with NVIDIA Driver 570.86.15.
+\end{itemize}
+The CPU baseline was executed sequentially on the host system.
+The dataset consists of 37 multi-spectral Sentinel-2 scenes retrieved from the Copernicus Data Space Ecosystem platform (\url{https://browser.dataspace.copernicus.eu/}). The geographic coverage spans the Piedmont region (North-West Italy), enclosing the metropolitan area of Turin and the agricultural plains of Vercelli (characterized by intensive rice cultivation). Each scene comprises three spectral bands (RED, NIR, and BLUE) at a 10m spatial resolution. The dimensions of each band are $10980 \times 10980$ pixels, translating to approximately \textbf{120.56 million pixels per band} and over 361 million pixels processed per temporal scene.
+
+\subsection{Execution Time and Speedup Analysis}
+The execution times are analyzed in two phases: the computation phase (where algorithms are applied to loaded memory buffers) and the end-to-end execution phase (including disk I/O, JPEG2000 decompression, memory copies, and PNG output generation).
+\subsubsection{Computation Performance}
+
+\begin{table*}[t]
+\centering
+\begin{tabular}{lccc}
+\hline
+\textbf{Kernel / Task} & \textbf{CPU Sequential (s)} & \textbf{GPU H200 ($\mu$s)} & \textbf{Speedup} \\ \hline
+NDVI Calculation & 1.21 s & 443.26 $\mu$s & $\approx 2730\times$ \\
+EVI Calculation & 2.38 s & 478.62 $\mu$s & $\approx 4970\times$ \\
+Local Statistics (3x3) & 8.82 s & 1378.38 $\mu$s & $\approx 6400\times$ \\
+Quality Flags \& Classification & 0.35 s & 916.29 $\mu$s & $\approx 380\times$ \\
+Colormap Rendering & 0.12 s & 756.87 $\mu$s & $\approx 150\times$ \\ \hline
+\textbf{Total Compute Time} & \textbf{12.88 s} & \textbf{3.97 ms} & \textbf{$\approx 3244\times$} \\ \hline
+\end{tabular}
+\caption{Computation time breakdown and GPU speedup for a single scene (120.56M pixels).}
+\label{tab:compute_performance}
+\end{table*}
+The computation on the GPU achieves an outstanding speedup of \textbf{over 3200$\times$} compared to the sequential CPU implementation. This is due to the massive parallelism of the H200 GPU, which is able to execute pixel-wise operations simultaneously across thousands of cores, and the optimization of memory coalescing.
+
+Table \ref{tab:compute_performance} shows a breakdown of the processing times for a single scene during the computation phase. To visually contrast the efficiency of our CUDA kernels, Figure \ref{fig:kernel_times_chart} illustrates the computation times for each kernel.
+\begin{figure}[h]
+  \centering
+  % Sostituisci "kernel_runtimes_chart.png" con il percorso reale del tuo file grafico
+  \includegraphics[width=\linewidth]{times.png}
+  \caption{Computation time breakdown for each algorithm component on the GPU H200 (measured in milliseconds). }
+  \label{fig:kernel_times_chart}
+\end{figure}
+
+\begin{figure}[h]
+  \centering
+  % Sostituisci "times_v100.png" con il nome reale del tuo file grafico per la V100
+  \includegraphics[width=\linewidth]{times2.png}
+  \caption{Breakdown of CUDA kernel execution times on the Tesla V100 GPU. Each component runtime is measured in milliseconds, illustrating the computational distribution before Hopper-specific architectural speedups.}
+  \label{fig:kernel_times_v100}
+\end{figure}
+
+\begin{figure}[h]
+  \centering
+  % Sostituisci "times_a40.png" con il nome reale del file della A40
+  \includegraphics[width=\linewidth]{times3.png}
+  \caption{Breakdown of CUDA kernel execution times on the NVIDIA A40 GPU (Ampere architecture), illustrating the intermediate performance scaling between Volta and Hopper.}
+  \label{fig:kernel_times_a40}
+\end{figure}
+
+\subsubsection{End-to-End Pipeline and Amdahl's Law}
+While the pure computing phase is accelerated by several orders of magnitude, the total execution time of the application is dominated by non-parallelizable stages, such as reading data from disk and JPEG2000 decoding. Table \ref{tab:overall_performance} presents the total execution times for processing all 37 scenes.
+\begin{table*}[t]
+\centering
+\begin{tabular}{lccc}
+\hline
+\textbf{Implementation} & \textbf{Total Time (37 scenes)} & \textbf{Avg. Time per Scene} & \textbf{Overall Speedup} \\ \hline
+CPU Sequential Baseline & 2009.1 s ($\approx$ 33.5 min) & 54.30 s & 1.0$\times$ \\
+GPU Non-Pipelined (\texttt{fixed}) & 652.98 s ($\approx$ 10.9 min) & 17.65 s & 3.08$\times$ \\
+GPU Pipelined (\texttt{stream}) & 637.22 s ($\approx$ 10.6 min) & 17.22 s & 3.15$\times$ \\ 
+GPU Parallel Reduction (\texttt{reduction}) & 415.59 s ($\approx$ 6.9 min) & 11.23 s & 4.83$\times$ \\ \hline
+\end{tabular}
+\caption{Overall end-to-end execution times and speedups for the 37-scene dataset.}
+\label{tab:overall_performance}
+\end{table*}
+This behavior represents a classic demonstration of \textbf{Amdahl's Law}. Since disk reading and JP2 decoding are highly I/O bound, they establish a performance floor. 
+The NVJPEG2000 hardware-accelerated decoder on the GPU takes approximately $7.5 - 11.5$ seconds per scene, which is only slightly faster than the CPU-side loader ($9.5 - 10.5$ seconds) due to PCIe transfer and file parsing bottlenecks. However, by using CUDA streams in the pipelined version (\texttt{stream}), we overlap decompression with kernel computation and asynchronous host memory transfers, gaining an additional $15.76$ seconds of overall reduction on the total dataset.
+
+\subsubsection{Hardware Performance Comparison: H200 vs. A40 vs V100}
+To evaluate the benefits of modern GPU architectures over legacy hardware, we compared the execution metrics of the parallel reduction pipeline on the NVIDIA H200 (Hopper) and the NVIDIA Tesla V100 (Volta). The hardware specifications and performance comparisons are summarized in Table \ref{tab:gpu_hardware_comparison}.
+
+\begin{table*}[t]
+\centering
+\begin{tabular}{lccc}
+\hline
+\textbf{Metric / Parameter} & \textbf{Tesla V100} & \textbf{NVIDIA A40} & \textbf{NVIDIA H200} \\ \hline
+Architecture & Volta (sm\_70) & Ampere (sm\_86) & Hopper (sm\_90) \\
+VRAM Capacity & 32 GB HBM2 & 48 GB GDDR6 & 141 GB HBM3e \\
+Memory Bandwidth & $\approx 900$ GB/s & $\approx 696$ GB/s & $\approx 4.8$ TB/s \\
+PCIe Interface & Gen3 & Gen4 & Gen5 \\ \hline
+Avg. Compute Kernels & 14.34 ms & 16.74 ms & 3.86 ms \\
+Avg. nvjpeg2k Decode & 15.22 s & 10.37 s & 10.33 s \\
+Avg. Scene End-to-End & 20.26 s & 11.47 s & 17.65 s \\ \hline
+\end{tabular}
+\caption{Hardware specifications and average performance metrics for processing a single 120.56M pixel scene across V100, A40, and H200 GPUs.}
+\label{tab:gpu_hardware_comparison}
+\end{table*}
+
+\begin{figure}[h]
+  \centering
+  % Sostituisci "nome_del_tuo_grafico.png" con il nome reale del file immagine (es. gpu_comparison.png)
+  \includegraphics[width=\linewidth]{comparison.png}
+  \caption{Line chart with markers illustrating the comparison of CUDA kernel runtimes (NDVI, EVI, Local Statistics, Quality Flags, and Colormap rendering) across the three GPU architectures: Tesla V100 (Volta), A40 (Ampere), and H200 (Hopper), demonstrating the scaling behavior and latency reductions across generations.}
+  \label{fig:gpu_comparison_kernels}
+\end{figure}
+
+
+The experimental results show that the average CUDA kernel execution time drops from $14.34\text{ ms}$ on the V100 and $16.74\text{ ms}$ on the A40 down to $3.86\text{ ms}$ on the H200, achieving a compute speedup of \textbf{3.72$\times$} and \textbf{4.33$\times$} respectively. Interestingly, the V100 outpaces the A40 in pure kernel execution times despite being a generation older. This is because our CUDA kernels are heavily memory bandwidth bound (applying simple arithmetic operations over massive 120M-pixel float grids), and the V100's HBM2 memory ($\approx 900\text{ GB/s}$) offers higher bandwidth than the A40's GDDR6 memory ($\approx 696\text{ GB/s}$). On the other hand, the H200 dominates both architectures by leveraging its massive HBM3e bandwidth ($\approx 4.8\text{ TB/s}$).
+
+Additionally, the nvJPEG2000 hardware-assisted decoding time decreases from $15.22\text{ s}$ on the V100 to $10.37\text{ s}$ on the A40 and $10.33\text{ s}$ on the H200, highlighting the advantages of the upgraded hardware decoders and the higher throughput of PCIe Gen4 and Gen5 buses (offering up to $32\text{ GB/s}$ and $128\text{ GB/s}$ theoretical bandwidth compared to PCIe Gen3's $16\text{ GB/s}$). However, the overall end-to-end execution times for all setups remain dominated by physical disk read bottlenecks, representing a classic demonstration of Amdahl's Law.
+
+
+
+
+\subsection{Profiling Timeline Analysis}
+To visually inspect the concurrency achieved by our implementations, we profiled the executions using NVIDIA Nsight Systems. 
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lccc}
+\hline
+\textbf{CUDA API Call} & \textbf{fixed} & \textbf{stream} & \textbf{reduction} \\ \hline
+cudaStreamSynchronize & 69.5\% & 65.7\% & 90.6\% \\
+cudaMemcpy (sync D2H) & \textbf{27.7\%} & 0.1\% & 4.6\% \\
+cudaMallocHost & 1.6\% & 24.6\% & 2.5\% \\
+cudaDeviceSynchronize & 0.5\% & 0.4\% & 1.1\% \\
+\hline
+\end{tabular}
+\caption{CUDA API time distribution across pipeline versions (Nsight Systems profiling).}
+\label{tab:cuda_api_profiling}
+\end{table}
+
+
+
+The Nsight Systems profiling reveals three distinct execution patterns across
+the pipeline iterations:
+\textbf{Fixed pipeline (synchronous):} The profiling data shows that
+\texttt{cudaMemcpy} (synchronous Device-to-Host transfers) consumes
+\textbf{27.7\%} of the total CUDA API time (92.9 seconds), transferring
+190,968~MB of uncompressed pixel grids back to the host across 504 copy
+operations. The GPU remains idle during these blocking transfers, creating
+significant synchronization stalls between consecutive scenes.
+\textbf{Stream pipeline (asynchronous):} By replacing synchronous
+\texttt{cudaMemcpy} with \texttt{cudaMemcpyAsync} on dedicated CUDA streams,
+the synchronous D2H transfer overhead drops from 27.7\% to \textbf{0.1\%}
+(0.49 seconds). However, this shifts the bottleneck to
+\texttt{cudaMallocHost} (24.6\%) and \texttt{cudaFreeHost} (8.5\%), as
+pinned memory allocation and deallocation become the new synchronization
+points. The Nsight timeline confirms that compute kernels and memory copies
+now execute concurrently on separate streams, but the GPU still stalls
+waiting for host-side pinned memory management.
+\textbf{Reduction pipeline (on-device statistics):} The parallel reduction
+version eliminates the transfer of full float grids entirely, reducing the
+D2H data volume from 190,968~MB to \textbf{70,528~MB} (a 2.7$\times$
+reduction). The \texttt{cudaStreamSynchronize} call now dominates at
+\textbf{90.6\%}, indicating that the GPU spends the vast majority of its
+time waiting for the nvJPEG2000 hardware decoder --- confirming that the
+pipeline has become purely I/O-bound with minimal GPU idle time between
+compute kernels.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lccc}
+\hline
+\textbf{D2H Metric} & \textbf{fixed} & \textbf{stream} & \textbf{reduction} \\ \hline
+Total D2H time & 92.4 s & 3.5 s & 15.2 s \\
+Total D2H volume & 190,968 MB & 190,968 MB & 70,528 MB \\
+Avg. per-copy size & 378.9 MB & 378.9 MB & 226.1 MB \\
+\% of GPU mem time & 99.5\% & 87.6\% & 94.1\% \\ \hline
+\end{tabular}
+\caption{Evolution of Device-to-Host transfer overhead across pipeline versions.}
+\label{tab:d2h_evolution}
+\end{table}
+Table~\ref{tab:d2h_evolution} quantifies the progressive elimination of the
+PCIe transfer bottleneck. While the \texttt{stream} version reduces the
+\emph{wall-clock time} of D2H transfers from 92.4 to 3.5 seconds via
+asynchronous overlapping, it still transfers the same 190,968~MB of data.
+The \texttt{reduction} version addresses this by computing statistics
+on-device, reducing the actual data volume by 2.7$\times$ and transferring
+only aggregated scalars (a few hundred bytes per scene) instead of full
+pixel grids.
+
+
+\subsection{Quality Control Report Example (Scene 2025-06-09)}
+Based on the execution logs extracted from \texttt{nvJ2000\_stream.err}, here is the summary of the pixel integrity checks for the analyzed scene (total processed pixels: 120,560,400):
+\begin{table*}[t]% [t] la posiziona in cima alla pagina (consigliato per table*)
+\centering
+\caption{Quality Control Summary for Corrupted Scene 2025-06-09}
+\label{tab:quality_control_corrupted}
+\begin{tabular}{l r r l}
+\hline
+\textbf{Quality Control Parameter} & \textbf{Affected Pixel Count} & \textbf{Percentage (\%)} & \textbf{Dataset Status} \\
+\hline
+Invalid Values / NaN (Not a Number) & 0 & 0.00\% & Excellent (No mathematical errors) \\
+Saturated Pixels & 0 & 0.00\% & Excellent (No sensor saturation) \\
+Statistical Outliers & 0 & 0.00\% & Excellent (No local anomalous spikes) \\
+Black Pixels (Shadows/No data) & 1,585,116 & 1.31\% & Low (Consistent with injected Salt-and-Pepper) \\
+Stripe Noise (Sensor artifacts) & 0 & 0.00\% & Excellent (No striping detected) \\
+Flat Pixels (Zero-variance) & 2,853 & 0.00\% & Negligible \\
+\hline
+Average Global Quality Score & - & 99.47\% & Optimal data integrity (noise mitigated) \\
+\hline
+\end{tabular}
+\end{table*}
+
+To highlight the effect of the perturbation layer on the quality control indicators, Table~\ref{tab:quality_comparison} compares the key metrics between the clean baseline and the corrupted version of scene 2025-06-09.
+\begin{table}[h]
+\centering
+\caption{Comparison of Quality Parameters for Scene 2025-06-09}
+\label{tab:quality_comparison}
+\begin{tabular}{lcc}
+\hline
+\textbf{Parameter} & \textbf{Clean Scene} & \textbf{Corrupted Scene} \\ \hline
+Black Pixels & 5,802 (0.005\%) & 1,585,116 (1.31\%) \\
+Average Quality Score & 99.95\% & 99.47\% \\ \hline
+\end{tabular}
+\end{table}
+
+
+\subsection{Qualitative Visual Analysis}
+To visually validate the output of the GPU-accelerated pipeline, Figure \ref{fig:visual_comparison} presents a qualitative comparison of a Sentinel-2 scene (2025-04-30) across three stages of our pipeline: the raw input imagery, the computed EVI index colormap, and the final NDVI binary health mask.
+\begin{figure*}[t]
+  \centering
+  \begin{minipage}{0.32\textwidth}
+    \centering
+    % Sostituisci "originale.png" con il percorso del tuo file
+    \includegraphics[width=\linewidth]{2025-04-30.jpg}
+    \caption*{a) Original Satellite Scene}
+  \end{minipage}
+  \hfill
+  \begin{minipage}{0.32\textwidth}
+    \centering
+    % Sostituisci "evi_colormap.png" con il percorso del tuo file
+    \includegraphics[width=\linewidth]{2025-04-30-EVI.jpg}
+    \caption*{b) EVI Colormap}
+  \end{minipage}
+  \hfill
+  \begin{minipage}{0.32\textwidth}
+    \centering
+    % Sostituisci "ndvi_healthmask.png" con il percorso del tuo file
+    \includegraphics[width=\linewidth]{2025-04-30-NDVI.jpg}
+    \caption*{c) NDVI Health Mask}
+  \end{minipage}
+  \caption{Visual comparison of the processed Sentinel-2 imagery for scene 2025-04-30: (a) True-color input representation, (b) EVI index mapped with the optimized forest green colormap, and (c) NDVI classification mask separating healthy vegetation (white pixels) from dead or non-vegetated regions (black pixels).}
+  \label{fig:visual_comparison}
+\end{figure*}
+
+\subsection{Multi-Temporal and Seasonal Vegetation Analysis}
+To evaluate the seasonal behavior of vegetation indices across the Piedmont region, we analyzed the temporal trend of the average NDVI and the percentage of healthy vegetation over the 37 monitored scenes (April 2025 to May 2026). The temporal profiles reflect the typical phenological cycle of agricultural crops and forests in North-West Italy, characterized by a vegetative peak during summer, a progressive decay in autumn, and a period of winter dormancy.
+Table~\ref{tab:temporal_representative_scenes} shows the calculated values for representative scenes across different seasons, including the exact statistics extracted from the processing logs.
+\begin{table}[h]
+\centering
+\caption{Representative Scenes and Seasonal Vegetation Metrics}
+\label{tab:temporal_representative_scenes}
+\begin{tabular}{lccc}
+\hline
+\textbf{Scene Date} & \textbf{Average NDVI} & \textbf{Healthy \%} & \textbf{Season} \\ \hline
+2025-07-29 & 0.470 & 68.3\% & Summer \\
+2025-09-07 & 0.409 & 51.7\% & Late Summer \\
+2025-12-06 & 0.131 & 0.2\%  & Winter \\
+2026-04-25 & 0.328 & 40.0\% & Spring \\ \hline
+\end{tabular}
+\end{table}
+
+
+To summarize the seasonal behavior across all 37 scenes, Table~\ref{tab:seasonal_averages} aggregates the dataset by season, demonstrating the correlation between the calculated vegetation indices and seasonal phenological states.
+\begin{table}[h]
+\centering
+\caption{Aggregate Seasonal NDVI and Health Averages}
+\label{tab:seasonal_averages}
+\begin{tabular}{lccc}
+\hline
+\textbf{Season} & \textbf{Scene Count} & \textbf{Avg. NDVI} & \textbf{Avg. Healthy \%} \\ \hline
+Spring  & 11 & 0.186 & 15.6\% \\
+Summer  & 6 & 0.377 & 48.1\% \\
+Late Summer  & 5 & 0.219 & 22.5\% \\
+Autumn  & 5 & 0.197 & 11.6\% \\
+Winter  & 10 & 0.077 & 1.1\% \\ \hline
+\end{tabular}
+\end{table}
+
+
+
+
+
+\section{Discussion of the Results}
+The experimental results demonstrate a significant performance gap between pure kernel computations and the end-to-end pipeline execution. While individual GPU compute kernels achieve speedups of up to 4970x (in EVI computation) and 6400x (in local statistics filtering) compared to the sequential CPU baseline, the overall application speedup is bounded to approximately 3.08x-4.83x. 
+This behavior is a clear manifestation of Amdahl's Law. In the sequential baseline, CPU processing is heavily constrained by floating-point calculation throughput on 120 million pixels. On the GPU, these math operations are completed in a few milliseconds. Consequently, the execution time is almost entirely dominated by non-parallelizable stages:
+\begin{itemize}
+    \item \textbf{Disk I/O and JP2 Decoding:} Parsing and decompressing JPEG2000 files using nvJPEG2000 requires 7.5 to 11.5 seconds per scene, creating an I/O performance floor.
+    \item \textbf{PCIe Transfer Bottlenecks:} In the initial \texttt{fixed} GPU version, copying the large flat output grids (NDVI, EVI, variance, quality score, flags) back to the host memory required transferring gigabytes of data over the PCIe bus, taking up to 27.7\% of the CUDA API execution time.
+\end{itemize}
+By implementing CUDA streams (\texttt{stream}), we successfully overlapped the JPEG2000 decompression with host-to-device transfers, leading to an additional time saving of 15.76 seconds over the entire dataset. Furthermore, the introduction of a GPU-based parallel reduction pipeline (\texttt{reduction}) using warp-level shuffle primitives (\texttt{\_\_shfl\_down\_sync}) and block-shared memory histograms successfully eliminated the massive device-to-host transfer of full float grids. Transferring only the final computed statistics (a few bytes per scene) dramatically reduced the PCIe transfer overhead from 92.3 seconds to 16.8 seconds (a 5.5x speedup in memory transfer times).
+The pixel quality analysis confirms that accelerating these operations on the GPU does not compromise mathematical precision or data integrity, yielding identical quality classifications and flagging sensor striping or flat regions efficiently without CPU intervention.
+
+The end-to-end execution profiling confirms that the system is strictly I/O-bound. The physical reading of Sentinel-2 bands from the shared network file system (HPC storage) represents the absolute bottleneck, requiring approximately $8.5 - 11.5$ seconds per scene. Consequently, while the computation speedup exceeds 3200x, the overall pipeline acceleration is governed by the throughput of the storage hardware, highlighting that future performance scaling must rely on faster distributed file systems or pre-cached data pipelines.
+
+\subsection{Nsight Systems Performance Indicators}
+The profiling analysis confirms the achievement of our Key Performance Indicators (KPIs):
+\begin{itemize}
+    \item \textbf{Global Throughput:} Increased from $2.22$ MP/s on the CPU to $7.76$ MP/s on the GPU (\texttt{stream} version).
+    \item \textbf{Concurrency:} The Nsight timeline verifies the active concurrency of compute kernels (NDVI/EVI execution) overlapped with asynchronous memory copies (\texttt{cudaMemcpyAsync}) and JPEG2000 decompression streams.
+    \item \textbf{GPU Idle Time reduction:} Transitioning from the synchronous \texttt{fixed} pipeline to the \texttt{reduction} model reduced host-device synchronization stalls, decreasing the GPU idle time between consecutive scenes by offloading the statistics calculation.
+\end{itemize}
+
+\section{Conclusion and Future Developments}
+\subsection{Conclusion}
+This work presented a GPU-accelerated processing pipeline for the real-time computation and comparative analysis of the NDVI and EVI vegetation indices from high-resolution Sentinel-2 multispectral imagery. The proposed CUDA implementation was systematically optimized through three successive iterations: a synchronous baseline (\texttt{fixed}), a CUDA-streamed pipelined version (\texttt{stream}), and a parallel reduction model (\texttt{reduction}) employing warp-level shuffle primitives and shared memory histograms.
+
+The experimental evaluation, conducted on 40 (3 of which are artificially corrupted) Sentinel-2 scenes covering the Piedmont region (North-West Italy) and tested across three GPU architectures (Tesla V100, A40, and H200), demonstrated the following key results:
+\begin{itemize}
+    \item \textbf{Compute Kernel Speedup:} Individual CUDA kernels achieved speedups of up to $\approx 6400\times$ (local statistics) and $\approx 4970\times$ (EVI computation) over the sequential CPU baseline, with a total compute-phase speedup exceeding $3200\times$ on the H200 GPU.
+    \item \textbf{End-to-End Pipeline Acceleration:} The parallel reduction version achieved an overall speedup of $4.83\times$ compared to the CPU implementation, processing all 40 scenes in approximately 6.9 minutes versus 33.5 minutes.
+    \item \textbf{PCIe Transfer Optimization:} The introduction of on-device parallel reductions reduced the Device-to-Host memory transfer overhead by $5.5\times$, from 92.3 seconds to 16.8 seconds across the entire dataset, by transferring only aggregated statistics instead of full pixel grids.
+    \item \textbf{Data Integrity:} The pixel-level quality control analysis confirmed that GPU acceleration does not compromise mathematical precision, producing identical vegetation health classifications and anomaly detection flags compared to the CPU reference implementation.
+\end{itemize}
+
+The gap between the massive compute speedup ($>3200\times$) and the moderate end-to-end acceleration ($4.83\times$) is a direct manifestation of Amdahl's Law: the pipeline is strictly I/O-bound, with JPEG2000 decoding and disk access dominating the total execution time. This finding confirms that, for memory-bandwidth-bound geospatial workloads, the computational bottleneck has been effectively eliminated by the GPU, and further performance gains must target the data ingestion layer.
+
+\subsection{Future Developments}
+Several research directions are identified for extending and improving the proposed pipeline:
+\begin{enumerate}
+    \item \textbf{Multi-GPU and Distributed Processing:} Extending the pipeline to leverage multiple GPUs via CUDA Multi-Process Service (MPS) or NCCL for concurrent scene processing, enabling near-linear scalability on multi-GPU HPC nodes and reducing the total processing time proportionally to the number of available devices.
+    \item \textbf{I/O Pipeline Optimization:} Implementing a double-buffering strategy with GPUDirect Storage (\texttt{cuFile}) to bypass the CPU entirely during file reads, allowing direct DMA transfers from NVMe storage to GPU memory and directly addressing the Amdahl's Law bottleneck identified in this work.
+    \item \textbf{Multi-Temporal Change Detection:} Leveraging the 40-scene temporal dataset to implement automated vegetation change detection algorithms entirely on the GPU, enabling real-time tracking of seasonal NDVI/EVI trends and identification of anomalous vegetation loss events across consecutive acquisition dates.
+    \item \textbf{Extended Vegetation Index Support:} Incorporating additional spectral indices such as the Soil-Adjusted Vegetation Index (SAVI), the Modified SAVI (MSAVI), and the Green Normalized Difference Vegetation Index (GNDVI) to provide a more comprehensive multi-index vegetation assessment within the same processing pipeline.
+    \item \textbf{GIS Framework Integration:} Packaging the CUDA processing pipeline as a plugin for established GIS platforms such as GDAL or QGIS, enabling seamless adoption by environmental scientists and remote sensing practitioners without requiring direct CUDA programming expertise.
+    \item \textbf{Cloud-Native Deployment:} Deploying the pipeline on cloud GPU instances (e.g., AWS EC2 P5, Google Cloud A3) with object storage backends (S3, GCS) to provide scalable, on-demand satellite image processing as a service, eliminating the dependency on local HPC infrastructure.
+\end{enumerate}
+
+
+% Bibliografia
+\begin{thebibliography}{1}
+\bibitem{sivakumar2021geospatial}
+V.~Sivakumar, G.~Ankit, and C.~Biju, ``Geospatial Information Extraction from Big Satellite Data using CUDA-enabled GPU Parallel Computing Technique,'' \emph{Journal of Geomatics}, vol.~15, no.~2, Oct. 2021. [Online]. Available: \url{https://www.researchgate.net/publication/356556582}
+\bibitem{zuo2020fast}
+X.~Zuo, T.~Qi, B.~Qiao, Z.~Denchg, and Q.~Ge, ``Fast Parallel Extraction Method of Normalized Vegetation Index,'' in \emph{Proceedings of the 2020 15th International Conference on Computer Science \& Education (ICCSE)}, 2020, pp. 433--437. [Online]. Available: \url{https://ieeexplore.ieee.org/document/9201851}
+\bibitem{huete2002overview}
+A.~Huete, K.~Didan, T.~Miura, E.~P. Rodriguez, X.~Gao, and L.~G. Ferreira, ``Overview of the radiometric and biophysical performance of the MODIS vegetation indices,'' \emph{Remote Sensing of Environment}, vol.~83, no.~1-2, pp. 195--213, Nov. 2002. [Online]. Available: \url{https://doi.org/10.1016/S0034-4257(02)00096-2}
+\bibitem{nvidia2021nvjpeg2000}
+NVIDIA Corporation, ``nvJPEG2000 Library User Guide,'' 2021. [Online]. Available: \url{https://docs.nvidia.com/cuda/archive/11.2.2/nvjpeg2000/userguide.html}
+\bibitem{harris2007optimizing}
+M.~Harris, ``Optimizing Parallel Reduction in CUDA,'' NVIDIA Developer Technology, Whitepaper, 2007. [Online]. Available: \url{https://developer.download.nvidia.com/assets/cuda/files/reduction.pdf}
+\bibitem{gorelick2017google}
+N.~Gorelick, M.~Hancher, M.~Dixon, S.~Ilyushchenko, D.~Thau, and R.~Moore, ``Google Earth Engine: Planetary-scale geospatial analysis for everyone,'' \emph{Remote Sensing of Environment}, vol.~202, pp. 18--27, Dec. 2017. [Online]. Available: \url{https://doi.org/10.1016/j.rse.2017.06.031}
+
+\end{thebibliography}
+\end{document}

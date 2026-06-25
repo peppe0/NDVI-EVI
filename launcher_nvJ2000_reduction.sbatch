@@ -52,7 +52,8 @@ if [ ! -f main_nvJ2000_reduction.cu ]; then
 fi
 
 echo "Using nvJPEG2000 from Conda environment at ${CONDA_PREFIX}"
-nvcc -gencode arch=compute_80,code=sm_80 \
+nvcc -gencode arch=compute_70,code=sm_70 \
+     -gencode arch=compute_80,code=sm_80 \
      -gencode arch=compute_86,code=sm_86 \
      -gencode arch=compute_90,code=sm_90 \
      main_nvJ2000_reduction.cu -o main_nvJ2000_reduction \
